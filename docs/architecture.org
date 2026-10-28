@@ -92,7 +92,7 @@ terminal prompt          local Lisp result       finalized scrollback
 
 | Library | Generic implementation | Autolith integration |
 |---------+------------------------+----------------------|
-| agentcomms | ACP v1 schema, symmetric JSON-RPC, owned request handlers and session lifecycle | Headless application ownership, durable replay, observer projection and editor approvals |
+| agentcomms | ACP v1 and v2 schemas, symmetric JSON-RPC, owned request handlers and session lifecycle | Headless application ownership, durable replay, observer projection, version 2 configuration and terminal projection, and editor approvals |
 | cl-llm-provider-api | Wire clients, request execution, context resolution, structured contracts, layered provider registry with model discovery | Builtin registrations, extension sources, the model cache file, subscription adapters, conversation projection, contributors |
 | cl-rfc8628 | Scoped credential use and coordinated refresh | Credential paths, bootstrap ownership, provider exchanges, checkpoint quiescence |
 | mcparen/managed | Connection lifecycle, discovery snapshots and budgets | Configuration, authorization, tool registry and provider schema projection |

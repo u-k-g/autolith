@@ -1486,6 +1486,7 @@
 (define-test-suite acp
   test-acp-observer-streams-one-response
   test-acp-observer-permission-validates-offered-choice
+  test-acp-observer-v2-command-permission-subject
   test-acp-observer-forwards-serialized-tool-execution
   test-acp-observer-tool-title-previews
   test-acp-observer-batches-thoughts-before-permission
@@ -1501,6 +1502,7 @@
   test-acp-session-close-timeout-retains-ownership
   test-acp-session-delayed-cancel-during-finalization
   test-acp-session-flushes-thoughts-on-prompt-exit
+  test-acp-v2-session-prompt-config-and-list
   test-acp-extension-portable-values
   test-acp-extension-wire-state-and-authority
   test-acp-extension-busy-and-notification-order

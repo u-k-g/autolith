@@ -108,13 +108,20 @@
     (let ((work (application-input-controller-take-queued-work controller)))
       (when work (user-message-input-copy (second work))))))
 
-(-> acp-input--present-user (acp-observer (or string user-message-input)) null)
-(defun acp-input--present-user (observer input)
+(-> acp-input--present-user
+    (acp-observer (or string user-message-input) &key (:message-id (or null string)))
+    null)
+(defun acp-input--present-user (observer input &key message-id)
   "Project newly persisted headless input through an ordinary ACP user update."
   (with-lock-held ((acp-observer-lock observer))
     (acp-observer--send
-     observer (agentcomms:acp-update-user-message
-               (agentcomms:acp-text-content (user-message-input-text input)))))
+     observer
+     (if (acp-observer-v2-p observer)
+         (agentcomms:acp-v2-update-user-message
+          (list (agentcomms:acp-text-content (user-message-input-text input)))
+          (or message-id "steering"))
+         (agentcomms:acp-update-user-message
+          (agentcomms:acp-text-content (user-message-input-text input))))))
   nil)
 
 (defmethod agent-observer-take-steering ((observer acp-observer))
@@ -137,7 +144,8 @@
                       :key #'agent-steering-input-identifier :test #'string=))))
         (when entry
           (application-input-controller--acknowledge-steering controller identifier)
-          (acp-input--present-user observer (agent-steering-input-content entry))))))
+          (acp-input--present-user observer (agent-steering-input-content entry)
+                                   :message-id (format nil "s~A" identifier))))))
   nil)
 
 (-> acp-input--user-persisted (acp-observer list) null)
@@ -150,7 +158,8 @@
                             (application-input-controller-active-work controller)))))
     (when work
       (application-input-controller--acknowledge-active-work controller identifier)
-      (acp-input--present-user observer (second work))))
+      (unless (acp-observer-v2-p observer)
+        (acp-input--present-user observer (second work)))))
   nil)
 
 (-> acp-input-close (acp-session) null)

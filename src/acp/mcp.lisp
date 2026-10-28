@@ -117,11 +117,11 @@
                "MCP ~A entries must contain string name and value." label))
             (cons (copy-seq name) (copy-seq value))))))
 
-(-> acp-mcp--server (hash-table t) mcp-server-configuration)
-(defun acp-mcp--server (server cwd)
+(-> acp-mcp--server (hash-table t &key (:version integer)) mcp-server-configuration)
+(defun acp-mcp--server (server cwd &key (version 1))
   "Validate a client declaration, then attach ephemeral literal bindings to native policy."
   (declare (ignore cwd))
-  (agentcomms:acp-validate-mcp-servers (list server))
+  (agentcomms:acp-validate-mcp-servers (list server) :version version)
   (let* ((name    (acp-mcp--field server "name" :required t))
          (type    (or (json-get server "type") "stdio"))
          (stdio-p (equal type "stdio"))
@@ -179,12 +179,15 @@
         (call-next-method runtime (lambda () (acp-mcp--credential-scope values function)))
         (call-next-method))))
 
-(-> acp-mcp-create-tool-registry (configuration list) tool-registry)
-(defun acp-mcp-create-tool-registry (configuration declarations)
+(-> acp-mcp-create-tool-registry (configuration list &key (:version integer)) tool-registry)
+(defun acp-mcp-create-tool-registry (configuration declarations &key (version 1))
   "Build the native registry with session-local client servers and no global mutation."
-  (let* ((servers                    (mapcar (lambda (declaration)
-                                               (acp-mcp--server declaration (config :working-directory configuration)))
-                                             (agentcomms:acp-validate-mcp-servers declarations)))
+  (let* ((validated                  (agentcomms:acp-validate-mcp-servers declarations :version version))
+         (servers                    (mapcar (lambda (declaration)
+                                               (acp-mcp--server declaration
+                                                                (config :working-directory configuration)
+                                                                :version version))
+                                             validated))
          (*mcp-server-registrations* (mcp-server-registrations))
          (names                      (make-hash-table :test #'equal)))
     (dolist (registration *mcp-server-registrations*)

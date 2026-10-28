@@ -12,7 +12,11 @@
    (permission-choice
     :initarg :permission-choice :initform "once"
     :accessor      acp-observer-test-client-permission-choice
-    :documentation "The permission option selected by the client."))
+    :documentation "The permission option selected by the client.")
+   (permission-params
+    :initform      nil
+    :accessor      acp-observer-test-client-permission-params
+    :documentation "The latest permission request params."))
   (:documentation "A minimal ACP client used by observer protocol tests."))
 
 (defmethod agentcomms:client-session-update
@@ -25,9 +29,10 @@
 (defmethod agentcomms:client-request-permission
     ((client acp-observer-test-client) session-id tool-call &key options params)
   "Snapshot the updates seen so far and select the client's configured permission choice."
-  (declare (ignore session-id tool-call options params))
+  (declare (ignore session-id tool-call options))
   (setf (acp-observer-test-client-permission-updates client)
-        (reverse (acp-observer-test-client-updates client)))
+        (reverse (acp-observer-test-client-updates client))
+        (acp-observer-test-client-permission-params client) params)
   (values ':selected (acp-observer-test-client-permission-choice client)))
 
 (defmethod agentcomms:client-extension-request ((client acp-observer-test-client) method params)
@@ -332,4 +337,44 @@
                           "editor auto applies only available external grants"))
            (test-assert (= before approval-count)
                         "editor auto never falls back to an approval prompt"))))))
+  nil)
+
+(-> test-acp-observer-v2-command-permission-subject () null)
+(defun test-acp-observer-v2-command-permission-subject ()
+  "Exercise a version 2 command permission request."
+  (with-test-configuration (configuration)
+    (let* ((service  (acp-observer-test-service configuration))
+           (session
+            (make-instance 'acp-session :service service :identifier "v2-permissions"
+                           :application      (make-instance 'application :configuration configuration)
+                           :protocol-version 2))
+           (observer (make-instance 'acp-observer :session session :turn-sequence 1))
+           (client   (make-instance 'acp-observer-test-client)))
+      (multiple-value-bind (server client-channel)
+          (agentcomms:make-acp-channel-pair)
+        (unwind-protect
+             (progn
+               (agentcomms:acp-agent-connect service server)
+               (agentcomms:acp-client-connect client client-channel)
+               (agentcomms:client-initialize client :protocol-version 2)
+               (setf (acp-observer-test-client-updates client) nil)
+               (let ((subject (agentcomms:acp-v2-command-permission-subject
+                               "echo hi" "/work" :tool-call-id "call-1")))
+                 (test-assert
+                  (acp-observer--approval
+                   observer "shell.run"
+                   :arguments (json-object "command" "echo hi" "directory" "/work/")
+                   :key       (list ':command "echo hi" "/work/")
+                   :subject   subject)
+                  "the version 2 permission request is approved")
+                 (let ((params (acp-observer-test-client-permission-params client)))
+                   (test-assert
+                    (equal "shell.run" (agentcomms:json-get params "title"))
+                    "the permission carries its prompt title")
+                   (test-assert
+                    (equal "command"
+                           (agentcomms:json-get
+                            (agentcomms:json-get params "subject") "type"))
+                    "the permission carries the command subject"))))
+          (agentcomms:connection-close (agentcomms:acp-client-connection client))))))
   nil)

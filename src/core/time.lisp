@@ -9,6 +9,14 @@
   "Convert Common Lisp UNIVERSAL-TIME to integer Unix-time seconds."
   (- universal-time *unix-epoch-universal-time*))
 
+(-> universal-time->rfc3339 (integer) string)
+(defun universal-time->rfc3339 (universal-time)
+  "Return UNIVERSAL-TIME as an RFC 3339 UTC timestamp."
+  (multiple-value-bind (second minute hour day month year)
+      (decode-universal-time universal-time 0)
+    (format nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ"
+            year month day hour minute second)))
+
 
 ;;;; -- RFC 3339 Parsing --
 

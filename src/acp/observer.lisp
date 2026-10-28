@@ -20,6 +20,23 @@
    (thought-state :initform nil :accessor acp-observer-thought-state
                   :type          (member nil :streaming :boundary)
                   :documentation "Whether contiguous thoughts continue or cross a provider response boundary.")
+   (response-counter :initform 0 :accessor acp-observer-response-counter :type (integer 0)
+                     :documentation "The number of provider responses presented in this turn.")
+   (agent-message-id :initform nil :accessor acp-observer-agent-message-id
+                     :type          (or null string)
+                     :documentation "The version 2 message id of the current agent response.")
+   (thought-message-id :initform nil :accessor acp-observer-thought-message-id
+                       :type          (or null string)
+                       :documentation "The version 2 message id of the current reasoning stream.")
+   (open-tool-calls :initform (make-hash-table :test #'equal) :reader acp-observer-open-tool-calls
+                    :documentation "Version 2 tool calls awaiting a terminal update.")
+   (open-terminals :initform (make-hash-table :test #'equal) :reader acp-observer-open-terminals
+                   :documentation "Version 2 shell tool calls and their display terminal ids.")
+   (compaction-counter :initform 0 :accessor acp-observer-compaction-counter :type (integer 0)
+                       :documentation "The number of compactions announced in this turn.")
+   (compaction-id :initform nil :accessor acp-observer-compaction-id
+                  :type          (or null string)
+                  :documentation "The current version 2 compaction id.")
    (lock :initform (make-lock "Autolith ACP updates") :reader acp-observer-lock
          :documentation "The lock serializing short presentation updates, never permission waits."))
   (:documentation "An incremental ACP presentation sink with editor authorization."))
@@ -37,6 +54,18 @@
   (make-instance 'acp-observer :session session
                  :turn-sequence         (conversation-next-sequence
                                          (application-conversation (acp-session-application session)))))
+
+(-> acp-observer-v2-p (acp-observer) boolean)
+(defun acp-observer-v2-p (observer)
+  "Return true when OBSERVER presents an ACP version 2 session."
+  (acp-session-v2-p (acp-observer-session observer)))
+
+(-> acp-observer--next-message-id (acp-observer string) string)
+(defun acp-observer--next-message-id (observer prefix)
+  "Return a fresh version 2 message id for OBSERVER with PREFIX."
+  (format nil "~A~D-~D" prefix
+          (acp-observer-turn-sequence observer)
+          (acp-observer-response-counter observer)))
 
 (-> acp-observer--send (acp-observer hash-table) null)
 (defun acp-observer--send (observer update)
@@ -133,15 +162,19 @@
 
 (-> acp-observer--tool-report
     (acp-observer &key (:identifier string) (:title string) (:status keyword)
-                  (:arguments t) (:output (option string))) hash-table)
-(defun acp-observer--tool-report (observer &key identifier title status arguments output)
+                  (:arguments t) (:output (option string)) (:content (option list)))
+    hash-table)
+(defun acp-observer--tool-report
+    (observer &key identifier title status arguments output content)
   "Construct a tool report using the same identity for progress and authorization."
   (agentcomms:acp-tool-call
    (acp-tool-identifier (acp-observer-turn-sequence observer) identifier)
    (acp-tool-title title arguments) :name title :kind (acp-tool-kind title) :status status
    :raw-input arguments :raw-output output
-   :content (when output
-              (list (agentcomms:acp-tool-call-content (agentcomms:acp-text-content output))))))
+   :content (or content
+                (when output
+                  (list (agentcomms:acp-tool-call-content
+                         (agentcomms:acp-text-content output)))))))
 
 (defmethod agent-observer-text ((observer acp-observer) text)
   "Stream assistant text and retain its length for nonstreamed response reconciliation.
@@ -152,8 +185,13 @@ fragments that providers interleave with empty content deltas."
   (when (plusp (length text))
     (with-lock-held ((acp-observer-lock observer))
       (text-buffer-append (acp-observer-streamed-text observer) text)
-      (acp-observer--send observer
-                          (agentcomms:acp-update-agent-message (agentcomms:acp-text-content text)))))
+      (acp-observer--send
+       observer
+       (if (acp-observer-v2-p observer)
+           (agentcomms:acp-v2-update-agent-message-chunk
+            (agentcomms:acp-text-content text)
+            (or (acp-observer-agent-message-id observer) "agent"))
+           (agentcomms:acp-update-agent-message (agentcomms:acp-text-content text))))))
   nil)
 
 (defmethod agent-observer-reasoning ((observer acp-observer) text)
@@ -163,33 +201,42 @@ fragments that providers interleave with empty content deltas."
     (with-lock-held ((acp-observer-lock observer))
       (acp-observer--send
        observer
-       (agentcomms:acp-update-agent-thought
-        (agentcomms:acp-text-content
-         (if (eq ':boundary (acp-observer-thought-state observer))
-             (format nil "~2%~A" text)
-             text))))))
+       (if (acp-observer-v2-p observer)
+           (agentcomms:acp-v2-update-agent-thought-chunk
+            (agentcomms:acp-text-content
+             (if (eq ':boundary (acp-observer-thought-state observer))
+                 (format nil "~2%~A" text)
+                 text))
+            (or (acp-observer-thought-message-id observer) "thought"))
+           (agentcomms:acp-update-agent-thought
+            (agentcomms:acp-text-content
+             (if (eq ':boundary (acp-observer-thought-state observer))
+                 (format nil "~2%~A" text)
+                 text)))))))
   nil)
 
 (-> acp-observer--plan (acp-observer) null)
 (defun acp-observer--plan (observer)
   "Project the durable workspace plan after its native publication."
   (let* ((session (acp-observer-session observer))
-         (plan    (plan-load (application-configuration (acp-session-application session)))))
+         (plan    (plan-load (application-configuration (acp-session-application session))))
+         (entries (when plan
+                    (mapcar (lambda (step)
+                              (agentcomms:acp-plan-entry
+                               (plan-step-text step)
+                               :status (ecase (plan-step-status step)
+                                         (:pending
+                                          ':pending)
+                                         (:doing
+                                          ':in-progress)
+                                         (:done
+                                          ':completed))))
+                            (workspace-plan-steps plan)))))
     (acp-observer--send
      observer
-     (agentcomms:acp-update-plan
-      (when plan
-        (mapcar (lambda (step)
-                  (agentcomms:acp-plan-entry
-                   (plan-step-text step)
-                   :status (ecase (plan-step-status step)
-                             (:pending
-                              ':pending)
-                             (:doing
-                              ':in-progress)
-                             (:done
-                              ':completed))))
-                (workspace-plan-steps plan))))))
+     (if (acp-observer-v2-p observer)
+         (agentcomms:acp-v2-update-plan "workspace" entries)
+         (agentcomms:acp-update-plan entries))))
   nil)
 
 (defmethod agent-observer-status ((observer acp-observer) status details)
@@ -200,53 +247,177 @@ fragments that providers interleave with empty content deltas."
   (with-lock-held ((acp-observer-lock observer))
     (case status
       (:user-message-persisted
-       (setf (acp-observer-turn-sequence observer) (getf details :sequence)))
+       (let ((sequence (getf details :sequence)))
+         (setf (acp-observer-turn-sequence observer) sequence)
+         (when (and (acp-observer-v2-p observer)
+                    (not (getf details :automatic-p)))
+           (acp-observer--send
+            observer
+            (agentcomms:acp-v2-update-user-message
+             (list (agentcomms:acp-text-content (getf details :text)))
+             (format nil "u~D" sequence))))))
       (:provider-request-started
        (application-idle-compaction-note-started
         (acp-session-application (acp-observer-session observer)))
+       (incf (acp-observer-response-counter observer))
+       (setf (acp-observer-agent-message-id observer)
+             (acp-observer--next-message-id observer "a")
+             (acp-observer-thought-message-id observer)
+             (acp-observer--next-message-id observer "t"))
        (text-buffer-clear (acp-observer-streamed-text observer))
        (when (acp-observer-thought-state observer)
          (setf (acp-observer-thought-state observer) ':boundary)))
       (:provider-request-completed
-       (application-idle-compaction-note-completed
-        (acp-session-application (acp-observer-session observer))
-        (getf details :usage)))
+       (let* ((application   (acp-session-application (acp-observer-session observer)))
+              (configuration (application-configuration application))
+              (usage         (getf details :usage)))
+         (application-idle-compaction-note-completed application usage)
+         (when (and (acp-observer-v2-p observer) (json-object-p usage))
+           (let* ((input  (or (json-get usage "input_tokens") 0))
+                  (output (or (json-get usage "output_tokens") 0))
+                  (used   (or (json-get usage "total_tokens") (+ input output)))
+                  (size   (config :context-window configuration)))
+             (when (and (integerp used) (plusp used) (integerp size) (plusp size))
+               (acp-observer--send
+                observer (agentcomms:acp-update-usage used size)))))))
       (:assistant-response-persisted
        (let ((text (getf details :text)) (streamed (acp-observer-streamed-text observer)))
          (when (and (stringp text) (uiop:string-prefix-p streamed text)
                     (< (length streamed) (length text)))
-           (acp-observer--send
-            observer (agentcomms:acp-update-agent-message
-                      (agentcomms:acp-text-content (subseq text (length streamed))))))))
+           (let ((tail (subseq text (length streamed))))
+             (acp-observer--send
+              observer
+              (if (acp-observer-v2-p observer)
+                  (agentcomms:acp-v2-update-agent-message-chunk
+                   (agentcomms:acp-text-content tail)
+                   (or (acp-observer-agent-message-id observer) "agent"))
+                  (agentcomms:acp-update-agent-message
+                   (agentcomms:acp-text-content tail))))))))
       ((:compaction-started :compaction-completed)
+       (when (acp-observer-v2-p observer)
+         (if (eq status ':compaction-started)
+             (progn
+               (incf (acp-observer-compaction-counter observer))
+               (setf (acp-observer-compaction-id observer)
+                     (format nil "compaction-~D-~D"
+                             (acp-observer-turn-sequence observer)
+                             (acp-observer-compaction-counter observer)))
+               (acp-observer--send
+                observer
+                (agentcomms:acp-v2-update-compaction
+                 (acp-observer-compaction-id observer) ':in-progress)))
+             (when (acp-observer-compaction-id observer)
+               (acp-observer--send
+                observer
+                (agentcomms:acp-v2-update-compaction
+                 (acp-observer-compaction-id observer) ':completed))
+               (setf (acp-observer-compaction-id observer) nil))))
        (setf (application-idle-compaction-episode
               (acp-session-application (acp-observer-session observer))) nil))
       (:tool-call-started
-       (acp-observer--send
-        observer
-        (agentcomms:acp-update-tool-call
-         (acp-observer--tool-report
-          observer :identifier (getf details :call-id) :title (getf details :tool)
-          :status    ':in-progress
-          :arguments (acp-observer--arguments observer (getf details :call-id))))))
-      (:tool-call-completed
-       (let ((identifier (acp-tool-identifier (acp-observer-turn-sequence observer)
-                                              (getf details :call-id)))
-             (output     (getf details :output)))
+       (let* ((arguments   (acp-observer--arguments observer (getf details :call-id)))
+              (identifier  (acp-tool-identifier (acp-observer-turn-sequence observer)
+                                                (getf details :call-id)))
+              (terminal-id (when (and (acp-observer-v2-p observer)
+                                      (string= (getf details :tool) "shell.run"))
+                             (format nil "term:~A" identifier)))
+              (report      (acp-observer--tool-report
+                            observer :identifier (getf details :call-id)
+                                     :title      (getf details :tool)
+                                     :status     ':in-progress
+                                     :arguments  arguments
+                                     :content    (when terminal-id
+                                                   (list (agentcomms:acp-terminal-content
+                                                          terminal-id))))))
+         (when terminal-id
+           (setf (gethash identifier (acp-observer-open-terminals observer)) terminal-id)
+           (acp-observer--send
+            observer
+            (agentcomms:acp-v2-update-terminal
+             terminal-id
+             :command (json-get arguments "command")
+             :cwd     (let ((directory (json-get arguments "directory")))
+                        (and (stringp directory)
+                             (namestring (uiop:ensure-directory-pathname directory)))))))
+         (when (acp-observer-v2-p observer)
+           (setf (gethash identifier (acp-observer-open-tool-calls observer)) report))
          (acp-observer--send
           observer
-          (agentcomms:acp-update-tool-call-progress
-           (agentcomms:acp-tool-call-update
-            identifier :status (if (getf details :success-p) ':completed ':failed)
-            :raw-output        output
-            :content           (list (agentcomms:acp-tool-call-content
-                                      (agentcomms:acp-text-content output))))))
+          (if (acp-observer-v2-p observer)
+              (agentcomms:acp-v2-update-tool-call report)
+              (agentcomms:acp-update-tool-call report)))))
+      (:tool-call-completed
+       (let* ((identifier  (acp-tool-identifier (acp-observer-turn-sequence observer)
+                                                (getf details :call-id)))
+              (output      (getf details :output))
+              (terminal-id (gethash identifier (acp-observer-open-terminals observer)))
+              (content     (if terminal-id
+                               (list (agentcomms:acp-terminal-content terminal-id))
+                               (list (agentcomms:acp-tool-call-content
+                                      (agentcomms:acp-text-content output)))))
+              (update      (agentcomms:acp-tool-call-update
+                            identifier
+                            :status     (if (getf details :success-p) ':completed ':failed)
+                            :raw-output output
+                            :content    content)))
+         (when terminal-id
+           (acp-observer--send
+            observer
+            (agentcomms:acp-v2-update-terminal
+             terminal-id
+             :output      (agentcomms:acp-v2-terminal-output
+                           (usb8-array-to-base64-string
+                            (utf8-string-to-octets (or output ""))))
+             :exit-status (agentcomms:acp-v2-terminal-exit-status
+                           (if (getf details :success-p) 0 1) nil)))
+           (remhash identifier (acp-observer-open-terminals observer)))
+         (when (acp-observer-v2-p observer)
+           (remhash identifier (acp-observer-open-tool-calls observer)))
+         (acp-observer--send
+          observer
+          (if (acp-observer-v2-p observer)
+              (agentcomms:acp-v2-update-tool-call update)
+              (agentcomms:acp-update-tool-call-progress update)))
          (when (string= (getf details :tool) "plan.update")
            (acp-observer--plan observer))))))
   nil)
 
-(-> acp-observer--permission (acp-observer hash-table list) (option string))
-(defun acp-observer--permission (observer report options)
+(-> acp-observer--session-info (acp-observer) null)
+(defun acp-observer--session-info (observer)
+  "Send the durable conversation title and last activity as a version 2 update."
+  (when (acp-observer-v2-p observer)
+    (let* ((conversation (application-conversation
+                          (acp-session-application
+                           (acp-observer-session observer))))
+           (title        (conversation-title conversation))
+           (updated      (conversation-last-activity-at conversation)))
+      (when title
+        (acp-observer--send
+         observer
+         (agentcomms:acp-update-session-info
+          :title      title
+          :updated-at (and (integerp updated) (universal-time->rfc3339 updated)))))))
+  nil)
+
+(-> acp-observer-cancel-open-tools (acp-observer) null)
+(defun acp-observer-cancel-open-tools (observer)
+  "Mark every version 2 tool call still open as cancelled."
+  (when (acp-observer-v2-p observer)
+    (let ((open (acp-observer-open-tool-calls observer)))
+      (maphash (lambda (identifier report)
+                 (declare (ignore report))
+                 (acp-observer--send
+                  observer
+                  (agentcomms:acp-v2-update-tool-call
+                   (agentcomms:acp-tool-call-update identifier :status ':cancelled))))
+               open)
+      (clrhash open)))
+  nil)
+
+(-> acp-observer--permission
+    (acp-observer hash-table list &key (:title (or null string)) (:subject t))
+    (option string))
+(defun acp-observer--permission (observer report options &key title subject)
   "Request a bounded editor decision and accept only an offered option."
   (let ((session (acp-observer-session observer)))
     (acp-session-check-cancelled session)
@@ -254,35 +425,48 @@ fragments that providers interleave with empty content deltas."
     (let ((choice
            (handler-case
                (multiple-value-bind (outcome identifier)
-                   (agentcomms:agent-request-permission
-                    (acp-session-service session) (acp-session-identifier session)
-                    report :options options :timeout *acp-permission-timeout-seconds*)
+                   (if (acp-observer-v2-p observer)
+                       (agentcomms:agent-request-permission-v2
+                        (acp-session-service session) (acp-session-identifier session)
+                        :title   (or title "Allow this operation?")
+                        :subject (or subject
+                                     (agentcomms:acp-v2-tool-call-permission-subject report))
+                        :options options
+                        :timeout *acp-permission-timeout-seconds*)
+                       (agentcomms:agent-request-permission
+                        (acp-session-service session) (acp-session-identifier session)
+                        report :options options :timeout *acp-permission-timeout-seconds*))
                  (when (and (eq outcome ':selected)
                             (find identifier options :test #'equal
-                                  :key                     (lambda (option) (agentcomms:json-get option "optionId"))))
+                                  :key                     (lambda (option)
+                                                             (agentcomms:json-get option "optionId"))))
                    identifier))
              (agentcomms:acp-error ()
                nil))))
       (acp-session-check-cancelled session)
       choice)))
 
-(-> acp-observer--approval (acp-observer string &key (:arguments hash-table) (:key t)) boolean)
-(defun acp-observer--approval (observer title &key arguments key)
+(-> acp-observer--approval
+    (acp-observer string &key (:arguments hash-table) (:key t) (:subject t))
+    boolean)
+(defun acp-observer--approval (observer title &key arguments key subject)
   "Ask for exact operation approval, retaining allow-always only for this session."
   (let* ((session (acp-observer-session observer))
          (saved   (with-lock-held ((acp-session-lock session))
-                    (gethash key (acp-session-permissions session)))))
+                    (gethash key (acp-session-permissions session))))
+         (report  (acp-observer--tool-report
+                   observer :identifier (or *acp-current-tool-call-id* (make-identifier))
+                   :title title :status ':pending :arguments arguments)))
     (acp-session-check-cancelled session)
     (or saved
         (let ((choice
                (acp-observer--permission
-                observer
-                (acp-observer--tool-report
-                 observer :identifier (or *acp-current-tool-call-id* (make-identifier))
-                 :title title :status ':pending :arguments arguments)
+                observer report
                 (list (agentcomms:acp-permission-option "once" "Allow once" ':allow-once)
                       (agentcomms:acp-permission-option "session" "Allow exact operation this session" ':allow-always)
-                      (agentcomms:acp-permission-option "deny" "Reject" ':reject-once)))))
+                      (agentcomms:acp-permission-option "deny" "Reject" ':reject-once))
+                :title   title
+                :subject subject)))
           (when (equal choice "session")
             (with-lock-held ((acp-session-lock session))
               (setf (gethash key (acp-session-permissions session)) t)))
@@ -306,10 +490,15 @@ fragments that providers interleave with empty content deltas."
                     :configuration              (application-configuration application)
                     :sandbox-available-p        (application--command-sandbox-available-p)))))
       (otherwise
-       (if (acp-observer--approval observer "shell.run"
-                                   :arguments (json-object "command" command
-                                                           "directory" (namestring directory))
-                                   :key       (list ':command command (namestring directory)))
+       (if (acp-observer--approval
+            observer "shell.run"
+            :arguments (json-object "command" command
+                                    "directory" (namestring directory))
+            :subject   (and (acp-observer-v2-p observer)
+                            (agentcomms:acp-v2-command-permission-subject
+                             command (namestring directory)
+                             :tool-call-id *acp-current-tool-call-id*))
+            :key       (list ':command command (namestring directory)))
            ':full-access
            ':deny)))))
 

@@ -276,6 +276,19 @@ The normal launch loads durable mutations and user initialization. For AUI, use
 =autolith --permissions auto acp=. Use =--pristine= when recovering from a damaged
 mutable image.
 
+ACP negotiates version 2 when the editor requests it and otherwise serves version
+1. Version 2 adds native session listing and resumption, message IDs,
+configuration options for mode, model, and reasoning effort, plans, context
+usage, compaction updates, and agent-owned shell terminals. Version 1 keeps the
+modes response, mode updates, and load-based replay.
+
+T3 Code uses the ACP version 2 preview. Add a local ACP command with executable
+=autolith= and one argument, =acp=. T3 reads the model, reasoning effort, and
+permission mode from session configuration options; lists and imports durable
+conversations; renders plans, usage, compaction, and shell terminals; and maps
+tool approvals onto its thread permission mode. Sign in with =autolith auth=
+before adding the command.
+
 New sessions use the editor's absolute working directory and a durable Autolith
 conversation ID. Load that ID to replay messages, visible reasoning, tool calls,
 and results. Text prompts, resource links, and embedded text resources are
@@ -284,8 +297,9 @@ supported. File and process operations use the native Autolith tools.
 The default =ask= mode requests command and external-tool approval in the editor.
 An approval for the session covers the exact command and working directory, or
 external tool identity and arguments. Select =auto=, =sandboxed=, or =full-access=
-through ACP session modes; use =--permissions auto|sandbox|full= on the command
-line. Changing modes clears session approvals.
+through ACP session modes in version 1 or the mode configuration option in
+version 2; use =--permissions auto|sandbox|full= on the command line. Changing
+modes clears session approvals.
 
 Client-supplied stdio and HTTP MCP servers are merged with native registrations
 for that session. Literal environment values and headers are ephemeral and

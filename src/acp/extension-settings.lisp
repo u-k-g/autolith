@@ -173,5 +173,9 @@
         (clrhash (acp-session-permissions session)))
       (agentcomms:agent-send-update
        (acp-session-service session) (acp-session-identifier session)
-       (agentcomms:acp-update-current-mode (string-downcase (symbol-name (acp-session-mode session))))))
+       (if (acp-session-v2-p session)
+           (agentcomms:acp-v2-update-config-options
+            (acp-service--config-options session))
+           (agentcomms:acp-update-current-mode
+            (string-downcase (symbol-name (acp-session-mode session)))))))
     (acp-extension--setting-item application (application-configuration application) setting)))

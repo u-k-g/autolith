@@ -40,6 +40,12 @@
    (application
     :initarg :application :reader acp-session-application :type application
     :documentation "The headless application owning its agent, tools, workers, and lease.")
+   (protocol-version
+    :initarg       :protocol-version
+    :initform      1
+    :reader        acp-session-protocol-version
+    :type          (integer 1)
+    :documentation "The ACP protocol version negotiated for this connection.")
    (mode
     :initarg :mode :initform ':ask :accessor acp-session-mode
     :documentation "The session's current permission policy.")
@@ -132,6 +138,11 @@
 
 (defvar *acp-extension-invocation-p* nil
   "Whether an explicit extension invocation owns this thread's cancellation boundary.")
+
+(-> acp-session-v2-p (acp-session) boolean)
+(defun acp-session-v2-p (session)
+  "Return true when SESSION's connection negotiated ACP version 2."
+  (eql 2 (acp-session-protocol-version session)))
 
 (-> acp-session-check-cancelled (acp-session) null)
 (defun acp-session-check-cancelled (session)

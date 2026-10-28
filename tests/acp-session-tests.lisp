@@ -86,8 +86,11 @@
   (agent-test-result "acp-test-response" (list (agent-test-message text))))
 
 (-> acp-session-test--call-with-client
-    (configuration function &key (:results list) (:provider (option model-provider))) t)
-(defun acp-session-test--call-with-client (configuration function &key results provider)
+    (configuration function &key (:results list) (:provider (option model-provider))
+                              (:protocol-version integer))
+    t)
+(defun acp-session-test--call-with-client
+    (configuration function &key results provider (protocol-version 1))
   "Run FUNCTION with the actual serving lifetime, a scripted provider, and owned cleanup."
   (let* ((provider (or provider (make-instance 'scripted-provider
                                                :configuration configuration :results results)))
@@ -107,7 +110,7 @@
            (unwind-protect
                 (progn
                   (agentcomms:acp-client-connect client client-channel)
-                  (agentcomms:client-initialize client)
+                  (agentcomms:client-initialize client :protocol-version protocol-version)
                   (funcall function service client))
              (when (agentcomms:acp-client-connection client)
                (agentcomms:connection-close (agentcomms:acp-client-connection client)))
@@ -506,7 +509,8 @@
             (append
              (list
               (list 'agent-run-user-turn
-                    (lambda (agent text &key observer automatic-p pending-input-identifier)
+                    (lambda (agent text &key observer automatic-p pending-input-identifier
+                                          &allow-other-keys)
                       (declare (ignore agent text automatic-p pending-input-identifier))
                       (agent-observer-reasoning observer "pending ")
                       (agent-observer-reasoning observer "thought")
@@ -641,3 +645,77 @@
                              tool-updates))
             "ok and legacy success statuses complete tools while failures fail")))
        :results nil))))
+
+(-> acp-session-test-v2-idle-p (acp-session-test-client) boolean)
+(defun acp-session-test-v2-idle-p (client)
+  "Return true when CLIENT has received a version 2 idle state."
+  (some (lambda (update)
+          (and (eq ':state-update (agentcomms:acp-update-kind update))
+               (equal "idle" (agentcomms:json-get update "state"))))
+        (acp-session-test-updates client)))
+
+(-> test-acp-v2-session-prompt-config-and-list () null)
+(defun test-acp-v2-session-prompt-config-and-list ()
+  "Exercise the ACP v2 prompt, config, list, and close surface."
+  (with-test-configuration (configuration root)
+    (acp-session-test--call-with-client
+     configuration
+     (lambda (service client)
+       (declare (ignore service))
+       (multiple-value-bind (identifier result)
+           (agentcomms:client-v2-new-session client (namestring root))
+         (let ((options (agentcomms:json-sequence->list
+                         (agentcomms:json-get result "configOptions"))))
+           (test-assert (find "mode" options :key (lambda (option)
+                                                    (agentcomms:json-get option "configId"))
+                              :test               #'equal)
+                        "the session advertises a mode config option"))
+         (multiple-value-bind (message-id prompt-result)
+             (agentcomms:client-v2-prompt
+              client identifier (list (agentcomms:acp-text-content "hello")))
+           (declare (ignore prompt-result))
+           (test-assert (and (stringp message-id) (plusp (length message-id)))
+                        "the prompt returns a message id")
+           (loop repeat 500
+                 until (acp-session-test-v2-idle-p client)
+                 do (sleep 0.01))
+           (test-assert (acp-session-test-v2-idle-p client)
+                        "the turn reaches idle")
+           (let ((updates (reverse (acp-session-test-updates client))))
+             (test-assert
+              (some (lambda (update)
+                      (and (eq ':user-message (agentcomms:acp-update-kind update))
+                           (equal message-id (agentcomms:json-get update "messageId"))))
+                    updates)
+              "the user message echoes the prompt message id")
+             (test-assert
+              (some (lambda (update)
+                      (and (eq ':state-update (agentcomms:acp-update-kind update))
+                           (equal "idle" (agentcomms:json-get update "state"))
+                           (equal "end_turn"
+                                  (agentcomms:json-get update "stopReason"))))
+                    updates)
+              "the idle state carries the stop reason")))
+         (let ((options (agentcomms:client-v2-set-config-option
+                         client identifier "mode" :value "auto")))
+           (test-assert
+            (equal "auto"
+                   (agentcomms:json-get
+                    (find "mode" options :key (lambda (option)
+                                                (agentcomms:json-get option "configId"))
+                          :test               #'equal)
+                    "currentValue"))
+            "the mode config option reports its new value"))
+         (multiple-value-bind (sessions next-cursor)
+             (agentcomms:client-v2-list-sessions client :cwd (namestring root))
+           (declare (ignore next-cursor))
+           (test-assert (find identifier sessions
+                              :key  (lambda (session)
+                                      (agentcomms:json-get session "sessionId"))
+                              :test #'equal)
+                        "the session appears in the session list"))
+         (test-assert (agentcomms:json-object-p
+                       (agentcomms:client-v2-close-session client identifier))
+                        "close returns an object")))
+     :protocol-version 2
+     :results          (list (acp-session-test-text-result "done")))))
